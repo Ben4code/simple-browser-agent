@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browseragent</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --border: #2a3139;
+    --text: #e6edf3; --dim: #8b949e; --accent: #4493f8;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .5px; }
+  header span { color: var(--dim); font-size: 12px; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px; }
+  form {
+    display: flex; flex-direction: column; gap: 10px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  label { font-size: 12px; color: var(--dim); }
+  input, textarea {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font: inherit;
+  }
+  textarea { resize: vertical; min-height: 60px; }
+  button {
+    align-self: flex-start; background: var(--accent); color: #fff;
+    border: 0; border-radius: 6px; padding: 8px 18px;
+    font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #run-meta { margin-top: 14px; font-size: 12px; color: var(--dim); }
+  #run-meta b { color: var(--text); }
+  #log {
+    margin-top: 10px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px;
+    height: 55vh; overflow-y: auto; padding: 12px 14px;
+  }
+  .ev { padding: 2px 0; white-space: pre-wrap; word-break: break-word; }
+  .ev .t { color: var(--dim); margin-right: 8px; }
+  .ev.tool   { color: var(--text); }
+  .ev.tool .c { color: var(--accent); }
+  .ev.tool_error { color: var(--err); }
+  .ev.run_started { color: var(--ok); margin-bottom: 6px; }
+  .ev.run_completed { color: var(--ok); margin-top: 6px; }
+  .ev.run_failed { color: var(--err); margin-top: 6px; }
+  .ev.info { color: var(--warn); }
+  .status { padding: 2px 10px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+  .status.completed, .status.partial { color: var(--ok); }
+  .status.failed, .status.error { color: var(--err); }
+  .status.running, .status.planning { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>browseragent</h1>
+  <span>Scout → Operator · agent-browser · GLM</span>
+</header>
+<main>
+  <form id="run-form">
+    <div>
+      <label for="goal">Goal (natural language)</label>
+      <textarea id="goal" required placeholder="Look up the pricing page and note the cheapest plan"></textarea>
+    </div>
+    <div>
+      <label for="url">Start URL</label>
+      <input id="url" type="url" required value="https://example.com"
+             pattern="https?://.*">
+    </div>
+    <button id="go" type="submit">Run</button>
+  </form>
+
+  <div id="run-meta" hidden>
+    run <b id="run-id"></b> · status <span class="status planning" id="run-status"></span>
+  </div>
+  <div id="log" hidden></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const form = $("run-form"), log = $("log"), meta = $("run-meta");
+let es = null, current = null;
+
+function stamp() {
+  return new Date().toLocaleTimeString([], { hour12: false });
+}
+
+function addEvent(kind, text) {
+  const div = document.createElement("div");
+  div.className = `ev ${kind}`;
+  div.innerHTML = `<span class="t">${stamp()}</span>`;
+  div.append(text);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function toolText(payload) {
+  return payload.command
+    ? `${kindGlyph(payload.kind)} ${payload.command}`
+    : JSON.stringify(payload);
+}
+function kindGlyph(k) {
+  return { tool: "⚙", tool_error: "✗", run_started: "▶", run_completed: "✔", run_failed: "✖" }[k] ?? "·";
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("go").disabled = true;
+  if (es) es.close();
+  log.textContent = "";
+  log.hidden = false;
+  meta.hidden = false;
+  $("run-id").textContent = "creating…";
+  $("run-status").textContent = "planning";
+  $("run-status").className = "status planning";
+
+  const resp = await fetch("/runs", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      goal: $("goal").value.trim(),
+      start_url: $("url").value.trim(),
+    }),
+  });
+  if (!resp.ok) {
+    addEvent("run_failed", `could not start run: HTTP ${resp.status}`);
+    $("go").disabled = false;
+    return;
+  }
+  const run = await resp.json();
+  current = run.id;
+  $("run-id").textContent = run.id;
+  startStream(run.id);
+});
+
+function startStream(runId) {
+  es = new EventSource(`/runs/${runId}/stream`);
+  es.addEventListener("update", (e) => {
+    const payload = JSON.parse(e.data);
+    const kind = payload.kind ?? "info";
+    let text;
+    if (kind.startsWith("tool")) text = kindGlyph(kind) + " " + payload.command;
+    else if (kind === "run_failed") text = `✖ ${payload.error}`;
+    else if (kind === "run_completed") text = `✔ ${payload.summary}` +
+      (payload.follow_ups?.length ? `  ⚠ follow-ups: ${payload.follow_ups.join("; ")}` : "");
+    else text = `${kindGlyph(kind)} ${Object.entries(payload)
+      .filter(([k]) => k !== "kind").map(([k, v]) => `${k}: ${v}`).join(" · ")}`;
+
+    addEvent(kind, text);
+
+    // status transitions: step events -> running; final events -> final status
+    if (kind === "tool" || kind === "tool_error") setStatus("running");
+    if (kind === "run_completed") { setStatus("completed"); finish(); }
+    if (kind === "run_failed") { setStatus("error"); finish(); }
+  });
+}
+
+function setStatus(s) {
+  const el = $("run-status");
+  el.textContent = s;
+  el.className = `status ${s}`;
+}
+function finish() {
+  $("go").disabled = false;
+  es.close();
+  fetch(`/runs/${current}`).then(r => r.json()).then(run => {
+    if (run?.status) setStatus(run.status);
+  });
+}
+</script>
+</body>
+</html>
